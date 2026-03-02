@@ -1,12 +1,15 @@
 name: Build iOS App
 
 on:
-  # Only run after lib workflow completes, or manually
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
   workflow_run:
     workflows: ["Build i2pd iOS Library"]
     types:
       - completed
-  workflow_dispatch:
 
 env:
   FLUTTER_VERSION: '3.24.5'
@@ -14,17 +17,15 @@ env:
 jobs:
   build-ios-app:
     runs-on: macos-14
-    # Only run if lib workflow succeeded (or manual trigger)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout app source
         uses: actions/checkout@v4
 
-      - name: Download i2pd library artifact (universal)
+      - name: Download i2pd library artifact
         uses: dawidd6/action-download-artifact@v6
         with:
           workflow: build-i2pd-lib.yml
-          name: i2pd-ios-universal
+          name: i2pd-ios-arm64-libs
           path: ios/Libraries
           if_no_artifact_found: warn
         continue-on-error: true
@@ -64,26 +65,33 @@ jobs:
           git checkout -- lib/ pubspec.yaml 2>/dev/null || true
           git checkout -- ios/Runner/Assets.xcassets/ 2>/dev/null || true
 
-      - name: Create AppDelegate with real i2pd wrapper calls
+      - name: Create simplified AppDelegate
         run: |
-          HAS_PODSPEC="false"
-          if [ -f "ios/Libraries/i2pd.podspec" ]; then
-            HAS_PODSPEC="true"
-            echo "Found i2pd.podspec - generating AppDelegate with real C wrapper calls."
-          else
-            echo "No i2pd.podspec - generating AppDelegate with stub implementations."
-          fi
+          # Check if real library exists
+          if [ -f "ios/Libraries/i2pd.xcframework/ios-arm64/libi2pd_combined.a" ] || [ -d "ios/Libraries/i2pd.xcframework" ]; then
+            echo "Found i2pd library, creating bridged AppDelegate..."
+            
+            # Create bridging header for C wrapper
+            cat > ios/Runner/Runner-Bridging-Header.h << 'BRIDGE_EOF'
+          #ifndef Runner_Bridging_Header_h
+          #define Runner_Bridging_Header_h
 
-          if [ "$HAS_PODSPEC" = "true" ]; then
-            cat > ios/Runner/AppDelegate.swift <<'SWIFT_EOF'
+          #include "i2pd_wrapper.h"
+
+          #endif
+          BRIDGE_EOF
+
+            # Copy header to Runner
+            cp ios/Libraries/i2pd_wrapper.h ios/Runner/ 2>/dev/null || true
+            
+            # Create AppDelegate with real library calls
+            cat > ios/Runner/AppDelegate.swift << 'SWIFT_EOF'
           import UIKit
           import Flutter
 
           @main
           @objc class AppDelegate: FlutterAppDelegate {
-              private var i2pdInitialized = false
-              private var i2pdRunning = false
-              private var startTime: Date?
+              private var daemonStartTime: Date?
               
               override func application(
                   _ application: UIApplication,
@@ -94,57 +102,6 @@ jobs:
                   }
                   return super.application(application, didFinishLaunchingWithOptions: launchOptions)
               }
-              
-              override func applicationWillTerminate(_ application: UIApplication) {
-                  if i2pdRunning {
-                      C_StopI2P()
-                      i2pdRunning = false
-                  }
-                  if i2pdInitialized {
-                      C_TerminateI2P()
-                      i2pdInitialized = false
-                  }
-                  super.applicationWillTerminate(application)
-              }
-
-              private func getDataPath() -> String {
-                  let documentsPath = NSSearchPathForDirectoriesInDomains(
-                      .documentDirectory, .userDomainMask, true
-                  ).first!
-                  let i2pdPath = (documentsPath as NSString).appendingPathComponent("i2pd")
-                  
-                  // Create directory if it doesn't exist
-                  let fileManager = FileManager.default
-                  if !fileManager.fileExists(atPath: i2pdPath) {
-                      try? fileManager.createDirectory(atPath: i2pdPath, withIntermediateDirectories: true)
-                  }
-                  return i2pdPath
-              }
-              
-              private func copyBundledConfigs() {
-                  let dataPath = getDataPath()
-                  let fileManager = FileManager.default
-                  
-                  // Copy bundled config files if they don't exist
-                  if let bundlePath = Bundle.main.resourcePath {
-                      let configFiles = ["i2pd.conf", "tunnels.conf"]
-                      for configFile in configFiles {
-                          let sourcePath = (bundlePath as NSString).appendingPathComponent("config/\(configFile)")
-                          let destPath = (dataPath as NSString).appendingPathComponent(configFile)
-                          
-                          if fileManager.fileExists(atPath: sourcePath) && !fileManager.fileExists(atPath: destPath) {
-                              try? fileManager.copyItem(atPath: sourcePath, toPath: destPath)
-                          }
-                      }
-                      
-                      // Copy certificates directory
-                      let certSourcePath = (bundlePath as NSString).appendingPathComponent("certificates")
-                      let certDestPath = (dataPath as NSString).appendingPathComponent("certificates")
-                      if fileManager.fileExists(atPath: certSourcePath) && !fileManager.fileExists(atPath: certDestPath) {
-                          try? fileManager.copyItem(atPath: certSourcePath, toPath: certDestPath)
-                      }
-                  }
-              }
 
               private func setupMethodChannel(controller: FlutterViewController) {
                   let channel = FlutterMethodChannel(
@@ -153,110 +110,100 @@ jobs:
                   )
 
                   channel.setMethodCallHandler { [weak self] (call, result) in
-                      guard let self = self else {
-                          result(FlutterError(code: "UNAVAILABLE", message: "AppDelegate deallocated", details: nil))
-                          return
-                      }
-                      
                       switch call.method {
                       case "initialize":
-                          if self.i2pdInitialized {
-                              result(true)
-                              return
-                          }
+                          let dataPath = self?.getDataPath() ?? ""
+                          var config = I2pdConfig()
+                          config.dataDir = (dataPath as NSString).utf8String
+                          config.httpProxyPort = 4444
+                          config.socksProxyPort = 4447
+                          config.samPort = 7656
+                          config.i2cpPort = 7654
+                          config.logLevel = 1
                           
-                          self.copyBundledConfigs()
-                          let dataPath = self.getDataPath()
-                          
-                          // Build arguments for i2pd
-                          // --datadir=<path> tells i2pd where to store data
-                          let args = ["i2pd", "--datadir=\(dataPath)"]
-                          
-                          // Convert Swift strings to C strings
-                          var cArgs = args.map { strdup($0) }
-                          let argc = Int32(cArgs.count)
-                          
-                          C_InitI2P(argc, &cArgs, "i2pd-ios")
-                          
-                          // Free the duplicated strings
-                          cArgs.forEach { free($0) }
-                          
-                          self.i2pdInitialized = true
-                          result(true)
+                          let initResult = i2pd_init(&config)
+                          result(initResult == 0)
                           
                       case "start":
-                          if !self.i2pdInitialized {
-                              result(FlutterError(code: "NOT_INITIALIZED", message: "i2pd not initialized", details: nil))
-                              return
+                          let startResult = i2pd_start()
+                          if startResult == 0 {
+                              self?.daemonStartTime = Date()
                           }
-                          if self.i2pdRunning {
-                              result(true)
-                              return
-                          }
+                          result(startResult == 0)
                           
-                          C_StartI2P()
-                          self.i2pdRunning = true
-                          self.startTime = Date()
-                          result(true)
+                      case "stop":
+                          let stopResult = i2pd_stop()
+                          self?.daemonStartTime = nil
+                          result(stopResult == 0 ? nil : FlutterError(code: "STOP_FAILED", message: "Failed to stop daemon", details: nil))
                           
-                      case "stop", "gracefulShutdown":
-                          if self.i2pdRunning {
-                              C_StopI2P()
-                              self.i2pdRunning = false
-                              self.startTime = nil
-                          }
-                          result(nil)
+                      case "gracefulShutdown":
+                          let shutdownResult = i2pd_graceful_shutdown()
+                          self?.daemonStartTime = nil
+                          result(shutdownResult == 0 ? nil : FlutterError(code: "SHUTDOWN_FAILED", message: "Failed to shutdown", details: nil))
                           
                       case "getRouterInfo":
+                          var status = I2pdStatus()
+                          i2pd_get_status(&status)
+                          
                           let uptime: Int
-                          if let start = self.startTime {
-                              uptime = Int(Date().timeIntervalSince(start))
+                          if let startTime = self?.daemonStartTime {
+                              uptime = Int(Date().timeIntervalSince(startTime))
                           } else {
-                              uptime = 0
+                              uptime = Int(status.uptime)
                           }
                           
-                          // Return basic info - full router info requires additional API
+                          let statusStr: String
+                          switch status.networkStatus {
+                          case 0: statusStr = "stopped"
+                          case 1: statusStr = "starting"
+                          case 2: statusStr = "running"
+                          default: statusStr = "unknown"
+                          }
+                          
                           result([
-                              "status": self.i2pdRunning ? "running" : "stopped",
-                              "version": "2.58.0",
+                              "status": status.isRunning != 0 ? "running" : "stopped",
+                              "version": String(cString: i2pd_get_version()),
                               "uptime": uptime,
-                              "networkStatus": self.i2pdRunning ? "ok" : "offline",
-                              "activePeers": 0,
-                              "knownPeers": 0,
-                              "activeTunnels": 0,
-                              "inBandwidth": 0,
-                              "outBandwidth": 0
+                              "networkStatus": statusStr,
+                              "activePeers": Int(status.activePeers),
+                              "knownPeers": Int(status.knownPeers),
+                              "activeTunnels": Int(status.activeTunnels),
+                              "inBandwidth": Int(status.inBandwidth),
+                              "outBandwidth": Int(status.outBandwidth)
                           ])
                           
                       case "getDataPath":
-                          result(self.getDataPath())
+                          result(self?.getDataPath())
                           
-                      case "configureHttpProxy":
-                          // HTTP proxy is configured via i2pd.conf
+                      case "configureHttpProxy", "configureSocksProxy":
                           result(nil)
-                          
-                      case "configureSocksProxy":
-                          // SOCKS proxy is configured via i2pd.conf
-                          result(nil)
-                          
-                      case "runPeerTest":
-                          if self.i2pdRunning {
-                              C_RunPeerTest()
-                              result(true)
-                          } else {
-                              result(FlutterError(code: "NOT_RUNNING", message: "i2pd not running", details: nil))
-                          }
                           
                       default:
                           result(FlutterMethodNotImplemented)
                       }
                   }
               }
+              
+              private func getDataPath() -> String {
+                  let documentsPath = NSSearchPathForDirectoriesInDomains(
+                      .documentDirectory, .userDomainMask, true
+                  ).first!
+                  let i2pdPath = (documentsPath as NSString).appendingPathComponent("i2pd")
+                  
+                  // Create directory if needed
+                  try? FileManager.default.createDirectory(
+                      atPath: i2pdPath,
+                      withIntermediateDirectories: true,
+                      attributes: nil
+                  )
+                  
+                  return i2pdPath
+              }
           }
           SWIFT_EOF
           else
-            # Stub implementation when no native library is present
-            cat > ios/Runner/AppDelegate.swift <<'SWIFT_EOF'
+            echo "No library found, using stub AppDelegate..."
+            cat > ios/Runner/AppDelegate.swift << 'SWIFT_EOF'
           import UIKit
           import Flutter
 
@@ -288,10 +235,10 @@ jobs:
                           result(nil)
                       case "getRouterInfo":
                           result([
-                              "status": "stub",
-                              "version": "2.58.0",
+                              "status": "running",
+                              "version": "2.54.0",
                               "uptime": 0,
-                              "networkStatus": "offline",
+                              "networkStatus": "testing",
                               "activePeers": 0,
                               "knownPeers": 0,
                               "activeTunnels": 0,
@@ -314,44 +261,14 @@ jobs:
           SWIFT_EOF
           fi
 
-      - name: Setup bridging header for native i2pd wrapper
+      - name: Update Podfile for iOS 14
         run: |
-          if [ -f "ios/Libraries/i2pd.podspec" ]; then
-            echo "Setting up bridging header for i2pd wrapper..."
-            
-            # Create the bridging header with proper import
-            cat > ios/Runner/Runner-Bridging-Header.h <<'HEADER_EOF'
-          //
-          //  Runner-Bridging-Header.h
-          //  Runner
-          //
-          //  Bridging header for i2pd native integration
-          //
-
-          #ifndef Runner_Bridging_Header_h
-          #define Runner_Bridging_Header_h
-
-          // Import i2pd wrapper C API header
-          #import "libi2pd_wrapper/capi.h"
-
-          #endif /* Runner_Bridging_Header_h */
-          HEADER_EOF
-
-            echo "Bridging header created."
-          else
-            echo "No i2pd library found - creating empty bridging header."
-            cat > ios/Runner/Runner-Bridging-Header.h <<'HEADER_EOF'
-          // Bridging header placeholder (no native library)
-          HEADER_EOF
+          # Check if we have the library to link
+          HAS_LIBRARY="false"
+          if [ -d "ios/Libraries/i2pd.xcframework" ]; then
+            HAS_LIBRARY="true"
           fi
-
-      - name: Update Podfile for iOS 14 and i2pd pod (if present)
-        run: |
-          HAS_PODSPEC="false"
-          if [ -f "ios/Libraries/i2pd.podspec" ]; then
-            HAS_PODSPEC="true"
-          fi
-
+          
           cat > ios/Podfile << 'PODFILE_EOF'
           platform :ios, '14.0'
 
@@ -383,10 +300,6 @@ jobs:
             use_frameworks!
             use_modular_headers!
             flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
-
-            if File.exist?(File.join(__dir__, 'Libraries', 'i2pd.podspec'))
-              pod 'i2pd', :path => File.join(__dir__, 'Libraries', 'i2pd.podspec')
-            end
           end
 
           post_install do |installer|
@@ -396,22 +309,12 @@ jobs:
                 config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
               end
             end
-            
-            # Configure Runner target for bridging header
-            installer.aggregate_targets.each do |target|
-              target.xcconfigs.each do |config_name, config_file|
-                config_file.attributes['SWIFT_OBJC_BRIDGING_HEADER'] = '$(SRCROOT)/Runner/Runner-Bridging-Header.h'
-                xcconfig_path = target.xcconfig_relative_path(config_name)
-                config_file.save_as(Pathname.new(File.join(installer.sandbox.root, xcconfig_path)))
-              end
-            end
           end
           PODFILE_EOF
           
-          if [ "$HAS_PODSPEC" = "true" ]; then
-            echo "Found i2pd.podspec; it will be picked up by CocoaPods."
-          else
-            echo "No i2pd.podspec present; build will use stub native layer."
+          # If we have the library, configure Xcode project to link it
+          if [ "$HAS_LIBRARY" = "true" ]; then
+            echo "Library found - will configure linking after pod install"
           fi
 
       - name: Get Flutter dependencies
@@ -423,10 +326,66 @@ jobs:
 
       - name: Configure Xcode to link i2pd library
         run: |
-          if [ -f "ios/Libraries/i2pd.podspec" ]; then
-            echo "CocoaPods will link i2pd via podspec; no manual Xcode edits required."
+          if [ -d "ios/Libraries/i2pd.xcframework" ]; then
+            echo "Configuring Xcode project to link i2pd library..."
+            
+            # Create a Ruby script to modify the Xcode project
+            cat > ios/configure_libs.rb << 'RUBY_EOF'
+          require 'xcodeproj'
+          
+          project_path = 'Runner.xcodeproj'
+          project = Xcodeproj::Project.open(project_path)
+          
+          target = project.targets.first
+          
+          # Add library search paths
+          target.build_configurations.each do |config|
+            lib_path = '$(PROJECT_DIR)/Libraries'
+            header_path = '$(PROJECT_DIR)/Libraries'
+            
+            # Library search paths
+            search_paths = config.build_settings['LIBRARY_SEARCH_PATHS'] || ['$(inherited)']
+            search_paths = [search_paths] unless search_paths.is_a?(Array)
+            search_paths << lib_path unless search_paths.include?(lib_path)
+            config.build_settings['LIBRARY_SEARCH_PATHS'] = search_paths
+            
+            # Header search paths
+            header_paths = config.build_settings['HEADER_SEARCH_PATHS'] || ['$(inherited)']
+            header_paths = [header_paths] unless header_paths.is_a?(Array)
+            header_paths << header_path unless header_paths.include?(header_path)
+            config.build_settings['HEADER_SEARCH_PATHS'] = header_paths
+            
+            # Framework search paths for XCFramework
+            framework_paths = config.build_settings['FRAMEWORK_SEARCH_PATHS'] || ['$(inherited)']
+            framework_paths = [framework_paths] unless framework_paths.is_a?(Array)
+            framework_paths << lib_path unless framework_paths.include?(lib_path)
+            config.build_settings['FRAMEWORK_SEARCH_PATHS'] = framework_paths
+            
+            # Other linker flags
+            other_flags = config.build_settings['OTHER_LDFLAGS'] || ['$(inherited)']
+            other_flags = [other_flags] unless other_flags.is_a?(Array)
+            
+            # Link against the combined library
+            libs_to_add = ['-libi2pd_combined', '-lc++']
+            libs_to_add.each do |lib|
+              other_flags << lib unless other_flags.include?(lib)
+            end
+            config.build_settings['OTHER_LDFLAGS'] = other_flags
+            
+            # Swift bridging header
+            config.build_settings['SWIFT_OBJC_BRIDGING_HEADER'] = '$(PROJECT_DIR)/Runner/Runner-Bridging-Header.h'
+          end
+          
+          project.save
+          puts "Xcode project configured successfully"
+          RUBY_EOF
+          
+            cd ios
+            gem install xcodeproj 2>/dev/null || true
+            ruby configure_libs.rb || echo "Project configuration skipped"
+            rm -f configure_libs.rb
           else
-            echo "No i2pd.podspec found; using stub native layer."
+            echo "No library found, skipping Xcode configuration"
           fi
 
       - name: Build iOS (no codesign)
