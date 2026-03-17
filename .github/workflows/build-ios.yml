@@ -236,7 +236,7 @@ jobs:
                       case "getRouterInfo":
                           result([
                               "status": "running",
-                              "version": "2.59.0",
+                              "version": "2.54.0",
                               "uptime": 0,
                               "networkStatus": "testing",
                               "activePeers": 0,
@@ -404,4 +404,4 @@ jobs:
         with:
           name: i2pd-ios-unsigned
           path: i2pd-ios-unsigned.ipa
-          retention-days: 30
+          retention-days: 90
