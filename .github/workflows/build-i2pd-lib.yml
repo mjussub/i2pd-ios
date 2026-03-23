@@ -1,4 +1,4 @@
-﻿name: Build i2pd iOS Library
+name: Build i2pd iOS Library
 
 on:
   workflow_dispatch:
@@ -12,8 +12,8 @@ env:
   OPENSSL_VERSION: '3.0.12'
   BOOST_VERSION: '1.84.0'
   BOOST_VERSION_UNDERSCORE: '1_84_0'
-  I2PD_VERSION: '2.58.0'
-  IOS_MIN_VERSION: '14.0'
+  I2PD_VERSION: '2.54.0'
+  IOS_MIN_VERSION: '11.0'
 
 jobs:
   build-ios-libs:
